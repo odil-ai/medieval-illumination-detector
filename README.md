@@ -8,7 +8,7 @@ The application loads ONNX image-classification models, applies the correspondin
 
 ## Try a demo 
 
-Test this app with a demo app on [![GitHub Pages](https://img.shields.io/badge/GitHub%20Pages-online-brightgreen?logo=github)](https://chartes.github.io/image-classifier-app/)
+Test this app with a demo app on [![GitHub Pages](https://img.shields.io/badge/GitHub%20Pages-online-brightgreen?logo=github)](https://odil-ai.github.io/medieval-illumination-detector/)
 
 ## Features
 
