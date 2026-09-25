@@ -212,7 +212,7 @@
       {
         "id": "mobilevitv2",
         "label": "MobileViTv2",
-        "baseUrl": "https://huggingface.co/lterriel/ENC-PSL/BSICLE/resolve/main/mobilevitv2"
+        "baseUrl": "https://huggingface.co/ENC-PSL/BSICLE/resolve/main/mobilevitv2"
       }
     ]
   }
