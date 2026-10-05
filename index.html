@@ -1157,13 +1157,13 @@
                             :disabled="selection.length === 0">
                         {{ t("openSelection") }}
                     </button>
-                    <button class="button mirador-button" @click="goNextSelected(1)"
-                            :disabled="selection.length === 0">
-                        {{ t("next") }}
-                    </button>
                     <button class="button mirador-button" @click="goNextSelected(-1)"
                             :disabled="selection.length === 0">
                         {{ t("previous") }}
+                    </button>
+                    <button class="button mirador-button" @click="goNextSelected(1)"
+                            :disabled="selection.length === 0">
+                        {{ t("next") }}
                     </button>
                 </div>
             </div>
@@ -1647,15 +1647,212 @@
     }
 
     /**
+     * Fixed-point precision of Pillow's 8-bit resampling coefficients
+     * (PRECISION_BITS in Pillow src/libImaging/Resample.c).
+     */
+    const PILLOW_PRECISION_BITS = 32 - 8 - 2;
+    const PILLOW_SCALE = 2 ** PILLOW_PRECISION_BITS;
+    const PILLOW_HALF = 2 ** (PILLOW_PRECISION_BITS - 1);
+
+    /**
+     * Number of source rows read at once by the resampler (bounds memory on large scans).
+     */
+    const RESAMPLE_STRIP_ROWS = 256;
+
+    /**
+     * Triangle filter used by Pillow's Image.BILINEAR (support 1).
+     *
+     * @param {number} x - Distance to the sample centre.
+     * @returns {number} Filter weight.
+     */
+    function bilinearFilter(x) {
+        const d = Math.abs(x);
+        return d < 1.0 ? 1.0 - d : 0.0;
+    }
+
+    /**
+     * Rounds a fixed-point accumulator to an 8-bit value like Pillow's clip8().
+     *
+     * @param {number} value - Accumulator (integer, scaled by 2^PILLOW_PRECISION_BITS).
+     * @returns {number} Value in [0, 255].
+     */
+    function clip8(value) {
+        const v = Math.floor(value / PILLOW_SCALE);
+        return v < 0 ? 0 : (v > 255 ? 255 : v);
+    }
+
+    /**
+     * Precomputes Pillow resampling bounds and fixed-point coefficients for one axis.
+     *
+     * Port of precompute_coeffs() and normalize_coeffs_8bpc() from Pillow
+     * (src/libImaging/Resample.c) for the bilinear filter.
+     *
+     * @param {number} inSize - Source length in pixels.
+     * @param {number} outSize - Output length in pixels.
+     * @returns {{bounds: Int32Array, coeffs: Int32Array, ksize: number}} Per output pixel:
+     *     first source index and number of taps (bounds), integer weights (coeffs).
+     */
+    function pillowCoefficients(inSize, outSize) {
+        const scale = inSize / outSize;
+        const filterScale = Math.max(scale, 1.0);
+        const support = 1.0 * filterScale;
+        const ksize = Math.ceil(support) * 2 + 1;
+        const bounds = new Int32Array(outSize * 2);
+        const coeffs = new Int32Array(outSize * ksize);
+        const weights = new Float64Array(ksize);
+
+        for (let xx = 0; xx < outSize; xx++) {
+            const center = (xx + 0.5) * scale;
+            const invScale = 1.0 / filterScale;
+            const xmin = Math.max(0, Math.trunc(center - support + 0.5));
+            const xmax = Math.min(inSize, Math.trunc(center + support + 0.5)) - xmin;
+
+            let total = 0.0;
+            for (let x = 0; x < xmax; x++) {
+                const w = bilinearFilter((x + xmin - center + 0.5) * invScale);
+                weights[x] = w;
+                total += w;
+            }
+            for (let x = 0; x < ksize; x++) {
+                const k = x < xmax ? (total !== 0.0 ? weights[x] / total : weights[x]) : 0.0;
+                coeffs[xx * ksize + x] = k < 0
+                    ? Math.trunc(-0.5 + k * PILLOW_SCALE)
+                    : Math.trunc(0.5 + k * PILLOW_SCALE);
+            }
+            bounds[xx * 2] = xmin;
+            bounds[xx * 2 + 1] = xmax;
+        }
+        return {bounds, coeffs, ksize};
+    }
+
+    /**
+     * Resizes an image exactly like Pillow's Image.resize((w, h), Image.BILINEAR).
+     *
+     * This is the resize used to train the models (torchvision
+     * transforms.Resize((size, size)) on PIL images). A single canvas drawImage()
+     * does not filter like Pillow when shrinking large scans, and the models are
+     * sensitive to that difference. Pillow resamples horizontally first, rounds
+     * to 8 bits, then resamples vertically; this function does the same. Source
+     * pixels are read at 1:1 scale, by strips of rows.
+     *
+     * Known remaining differences with Python: JPEG decoder details (±1 level),
+     * embedded ICC colour profiles and EXIF orientation (applied by the browser,
+     * ignored by Pillow), and alpha channels.
+     *
+     * @param {HTMLImageElement} image - Source image (decoded).
+     * @param {number} outWidth - Output width.
+     * @param {number} outHeight - Output height.
+     * @returns {ImageData} Resized RGBA image (alpha = 255).
+     */
+    function pillowResizeBilinear(image, outWidth, outHeight) {
+        const inWidth = image.naturalWidth || image.width;
+        const inHeight = image.naturalHeight || image.height;
+        const horizontal = pillowCoefficients(inWidth, outWidth);
+        const vertical = pillowCoefficients(inHeight, outHeight);
+
+        // 1) Horizontal pass on every source row, rounded to 8 bits (RGB).
+        const temp = new Uint8Array(outWidth * inHeight * 3);
+        const canvas = document.createElement("canvas");
+        canvas.width = inWidth;
+        canvas.height = Math.min(RESAMPLE_STRIP_ROWS, inHeight);
+        const context = canvas.getContext("2d", {willReadFrequently: true});
+
+        for (let y0 = 0; y0 < inHeight; y0 += canvas.height) {
+            const rows = Math.min(canvas.height, inHeight - y0);
+            context.clearRect(0, 0, canvas.width, canvas.height);
+            context.drawImage(image, 0, y0, inWidth, rows, 0, 0, inWidth, rows);
+            const src = context.getImageData(0, 0, inWidth, rows).data;
+
+            for (let r = 0; r < rows; r++) {
+                const rowOffset = r * inWidth * 4;
+                const outRow = (y0 + r) * outWidth * 3;
+                for (let xx = 0; xx < outWidth; xx++) {
+                    const xmin = horizontal.bounds[xx * 2];
+                    const taps = horizontal.bounds[xx * 2 + 1];
+                    const kOffset = xx * horizontal.ksize;
+                    let s0 = PILLOW_HALF;
+                    let s1 = PILLOW_HALF;
+                    let s2 = PILLOW_HALF;
+                    for (let x = 0; x < taps; x++) {
+                        const k = horizontal.coeffs[kOffset + x];
+                        const p = rowOffset + (xmin + x) * 4;
+                        s0 += src[p] * k;
+                        s1 += src[p + 1] * k;
+                        s2 += src[p + 2] * k;
+                    }
+                    const o = outRow + xx * 3;
+                    temp[o] = clip8(s0);
+                    temp[o + 1] = clip8(s1);
+                    temp[o + 2] = clip8(s2);
+                }
+            }
+        }
+
+        // 2) Vertical pass on the horizontally resampled rows.
+        const out = new Uint8ClampedArray(outWidth * outHeight * 4);
+        for (let yy = 0; yy < outHeight; yy++) {
+            const ymin = vertical.bounds[yy * 2];
+            const taps = vertical.bounds[yy * 2 + 1];
+            const kOffset = yy * vertical.ksize;
+            for (let xx = 0; xx < outWidth; xx++) {
+                let s0 = PILLOW_HALF;
+                let s1 = PILLOW_HALF;
+                let s2 = PILLOW_HALF;
+                for (let y = 0; y < taps; y++) {
+                    const k = vertical.coeffs[kOffset + y];
+                    const p = ((ymin + y) * outWidth + xx) * 3;
+                    s0 += temp[p] * k;
+                    s1 += temp[p + 1] * k;
+                    s2 += temp[p + 2] * k;
+                }
+                const o = (yy * outWidth + xx) * 4;
+                out[o] = clip8(s0);
+                out[o + 1] = clip8(s1);
+                out[o + 2] = clip8(s2);
+                out[o + 3] = 255;
+            }
+        }
+        return new ImageData(out, outWidth, outHeight);
+    }
+
+    /**
+     * Decodes an image without applying its embedded colour profile.
+     *
+     * Pillow (used for training) ignores ICC profiles, whereas browsers convert
+     * them to sRGB by default (Gallica scans often embed Adobe RGB or Gray Gamma
+     * profiles). Falls back to the image element if createImageBitmap fails.
+     *
+     * @param {HTMLImageElement} image - Decoded image element.
+     * @returns {Promise<ImageBitmap|HTMLImageElement>} Source to read pixels from.
+     */
+    async function decodeLikePillow(image) {
+        if (typeof createImageBitmap !== "function") return image;
+        try {
+            return await createImageBitmap(image, {colorSpaceConversion: "none"});
+        } catch (error) {
+            console.warn("createImageBitmap failed; using the image element as is.", error);
+            return image;
+        }
+    }
+
+    /**
      * Resizes an image to a square without preserving aspect ratio.
      *
-     * This matches torchvision.transforms.Resize((size, size)).
+     * Matches torchvision.transforms.Resize((size, size)) on PIL images, used for
+     * training (see pillowResizeBilinear). Falls back to a canvas resize if the
+     * exact resampler fails (e.g. image too large for a canvas).
      *
      * @param {HTMLImageElement} image - Source image.
      * @param {number} size - Output square size.
      * @returns {{imageData: ImageData, cropSize: number}} ImageData and output size.
      */
     function resizeSquare(image, size) {
+        try {
+            return {imageData: pillowResizeBilinear(image, size, size), cropSize: size};
+        } catch (error) {
+            console.warn("Exact (Pillow) resize failed, falling back to canvas resize.", error);
+        }
+
         const canvas = document.createElement("canvas");
         canvas.width = size;
         canvas.height = size;
@@ -3138,7 +3335,9 @@
             async inferImageElement(imageElement) {
                 if (!this.sess) throw new Error("ONNX session is not loaded.");
 
-                const input = imageToTensor(imageElement, this.preprocess);
+                const source = await decodeLikePillow(imageElement);
+                const input = imageToTensor(source, this.preprocess);
+                if (source !== imageElement && typeof source.close === "function") source.close();
                 const inputName = this.inputName || this.sess.inputNames[0];
                 const results = await this.sess.run({[inputName]: input});
                 const outputName = this.outputName || this.sess.outputNames[0];
